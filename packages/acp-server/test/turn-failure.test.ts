@@ -199,6 +199,31 @@ test('streams the turn a blocking Stop hook continues between editor prompts', {
   });
 });
 
+test('keeps session/prompt open until a blocking Stop hook continuation finishes', { timeout: 30_000 }, async ({ model, testHome }) => {
+  const answer = 'The parser reads tokens.';
+  const continued = 'I touched no files.';
+  const reason = 'Also list the files you touched.';
+  const decision = JSON.stringify({ hookSpecificOutput: { permissionDecision: 'deny', permissionDecisionReason: reason } });
+  const stopHook = `node -e "console.log(JSON.stringify(${decision.replaceAll('"', "'")}))"`;
+  model.script(say(answer), held('continued', say(continued)));
+
+  await inAcpSession({ model, testHome }, { hooks: [{ event: 'Stop', command: stopHook }] }, async (client, sessionId) => {
+    let settled = false;
+    const pending = promptAnswer(client, sessionId, 'Describe the parser.').finally(() => {
+      settled = true;
+    });
+
+    await model.hold('continued').reached();
+    expect(settled).toBe(false);
+    expect(agentText(client, sessionId)).toBe(answer);
+
+    model.hold('continued').release();
+    expect(await pending).toEqual({ result: { stopReason: 'end_turn' } });
+    expect(agentText(client, sessionId)).toBe(answer + continued);
+    expect(model.requests('main')).toHaveLength(2);
+  });
+});
+
 describe('a turn that fails after the editor asked to cancel it', () => {
   interface Launched {
     readonly turn_id: number;
@@ -208,17 +233,23 @@ describe('a turn that fails after the editor asked to cancel it', () => {
     readonly session: AcpSession;
     readonly cancels: unknown[];
     promptSent(): boolean;
+    promptId(): string | undefined;
     startTaskNotification(turnId: number): void;
     launch(launched: Launched): void;
     turnId(): number | undefined;
+    agentStartedTurnId(): number | undefined;
+    startTurn(event: { turnId: number; origin: unknown; promptId?: string }): void;
+    endTurn(event: { turnId: number; reason: 'completed' | 'cancelled' | 'failed' | 'blocked'; continuation?: 'turn' | 'background' | 'none'; error?: unknown }): void;
     endTurnWithFailure(turnId: number): void;
   } {
     const cancels: unknown[] = [];
     let launch: ((launched: Launched) => void) | undefined;
+    let submittedPromptId: string | undefined;
     const session = Object.create(AcpSession.prototype) as AcpSession;
     const internals = session as unknown as {
       driver?: { turnId?: number };
       agentStartedTurnId?: number;
+      onTurnStarted(event: unknown): void;
       onTurnEnded(event: unknown): void;
     };
     Object.assign(session as unknown as Record<string, unknown>, {
@@ -230,10 +261,12 @@ describe('a turn that fails after the editor asked to cancel it', () => {
       conn: { sessionUpdate: async () => {} },
       klient: { global: { kosong: { listModels: async () => [] } } },
       agent: {
-        prompt: () =>
-          new Promise<Launched>((resolve) => {
+        prompt: (input: { promptId?: string }) => {
+          submittedPromptId = input.promptId;
+          return new Promise<Launched>((resolve) => {
             launch = resolve;
-          }),
+          });
+        },
         cancel: async (target?: unknown) => {
           cancels.push(target);
         },
@@ -243,6 +276,7 @@ describe('a turn that fails after the editor asked to cancel it', () => {
       session,
       cancels,
       promptSent: () => launch !== undefined,
+      promptId: () => submittedPromptId,
       startTaskNotification: (turnId) => {
         internals.agentStartedTurnId = turnId;
       },
@@ -251,6 +285,13 @@ describe('a turn that fails after the editor asked to cancel it', () => {
         launch(launched);
       },
       turnId: () => internals.driver?.turnId,
+      agentStartedTurnId: () => internals.agentStartedTurnId,
+      startTurn: (event) => {
+        internals.onTurnStarted({ type: 'turn.started', ...event });
+      },
+      endTurn: (event) => {
+        internals.onTurnEnded({ type: 'turn.ended', ...event });
+      },
       endTurnWithFailure: (turnId) => {
         internals.onTurnEnded({
           turnId,
@@ -313,5 +354,57 @@ describe('a turn that fails after the editor asked to cancel it', () => {
     expect(editor.cancels).toEqual([{ turnId: 8 }]);
     editor.endTurnWithFailure(8);
     await expect(answer).resolves.toEqual({ stopReason: 'cancelled' });
+  });
+
+  test('cancels the follow-up turn when cancel arrives during a continuation gap', async () => {
+    const editor = cancellableSession();
+    let settled = false;
+    const answer = editor.session.prompt([{ type: 'text', text: 'Hello.' }]).finally(() => {
+      settled = true;
+    });
+    await vi.waitFor(() => {
+      expect(editor.promptSent()).toBe(true);
+    });
+    editor.launch({ turn_id: 7 });
+    await vi.waitFor(() => {
+      expect(editor.turnId()).toBe(7);
+    });
+
+    editor.endTurn({ turnId: 7, reason: 'completed', continuation: 'turn' });
+    expect(settled).toBe(false);
+    expect(editor.turnId()).toBeUndefined();
+
+    editor.session.cancel();
+    expect(editor.cancels).toEqual([]);
+
+    editor.startTurn({ turnId: 8, origin: { kind: 'system_trigger' } });
+    expect(editor.turnId()).toBe(8);
+    expect(editor.agentStartedTurnId()).toBeUndefined();
+    expect(editor.cancels).toEqual([{ turnId: 8 }]);
+
+    editor.endTurn({ turnId: 8, reason: 'cancelled', continuation: 'none' });
+    await expect(answer).resolves.toEqual({ stopReason: 'cancelled' });
+  });
+
+  test('claims the prompt turn from turn.started and ignores a late launch after continuation', async () => {
+    const editor = cancellableSession();
+    const answer = editor.session.prompt([{ type: 'text', text: 'Hello.' }]);
+    await vi.waitFor(() => {
+      expect(editor.promptSent()).toBe(true);
+    });
+
+    editor.startTurn({ turnId: 7, origin: { kind: 'user' }, promptId: editor.promptId() });
+    expect(editor.turnId()).toBe(7);
+
+    editor.endTurn({ turnId: 7, reason: 'completed', continuation: 'turn' });
+    editor.startTurn({ turnId: 8, origin: { kind: 'task' } });
+    expect(editor.turnId()).toBe(8);
+
+    editor.launch({ turn_id: 7 });
+    await Promise.resolve();
+    expect(editor.turnId()).toBe(8);
+
+    editor.endTurn({ turnId: 8, reason: 'completed', continuation: 'none' });
+    await expect(answer).resolves.toEqual({ stopReason: 'end_turn' });
   });
 });

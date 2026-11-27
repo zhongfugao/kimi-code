@@ -8,7 +8,7 @@ kimi acp
 
 启动后命令不会打印任何 banner，立刻等待 ACP 客户端在 stdin 上发出 `initialize` 请求。日志会写到标准错误（以及 `~/.kimi-code/logs/` 下的诊断日志），所以 ACP 通道本身保持干净。
 
-Kimi 自己发起回合时（汇报已完成的后台任务、`Stop` hook 拦截后续跑、执行定时任务），`kimi acp` 会通过 `session/update` 把回复和工具调用发送给 IDE，即使上一次 `session/prompt` 已经结束。这时提交新消息会收到 `turn.agent_busy`，可以等这个回合结束后重发。
+Kimi 自己发起回合时（如汇报已完成的后台任务或执行定时任务），`kimi acp` 会通过 `session/update` 把回复和工具调用发送给 IDE，即使上一次 `session/prompt` 已经结束。这时提交新消息会收到 `turn.agent_busy`，可以等这个回合结束后重发。如果当前 prompt 回合结束后立即衔接续跑回合（如 `Stop` hook 拦截后续跑），`session/prompt` 会保持挂起直到续跑回合结束再返回。
 
 ::: tip 谁会调用它？
 你通常不需要手动跑 `kimi acp`——这个命令是给 IDE 的子进程入口准备的。IDE 端的配置见[在 IDE 中使用](../guides/ides.md)。
